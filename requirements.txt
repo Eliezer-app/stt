@@ -1,0 +1,6 @@
+numpy
+packaging
+pywhispercpp
+sounddevice
+torch
+torchaudio

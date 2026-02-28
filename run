@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run STT: Silero VAD + pywhispercpp (Metal GPU).
+# Usage: stt/run --audio-source /tmp/speech-audio.sock
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/.venv/bin/python" -u "$DIR/listen.py" "$@"
