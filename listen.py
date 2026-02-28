@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import collections
+import json
 import select
 import socket
 import sys
@@ -78,15 +79,20 @@ def audio_from_socket(sock_path):
         sock.close()
 
 
-def check_stdin(target):
-    """Non-blocking check if a specific command arrived on stdin."""
+def read_stdin_cmd():
+    """Non-blocking read of a JSON command from stdin. Returns (cmd, data) or None."""
     ready, _, _ = select.select([sys.stdin], [], [], 0)
     if ready:
         line = sys.stdin.readline()
         if not line:
-            return "EOF"
-        if line.strip() == target:
-            return target
+            return ("EOF", {})
+        line = line.strip()
+        try:
+            data = json.loads(line)
+            return (data.get("cmd", ""), data)
+        except json.JSONDecodeError:
+            # Plain text fallback (e.g. "STOP")
+            return (line, {})
     return None
 
 
@@ -115,6 +121,7 @@ def main():
     frames = []
     silence_start = None
     last_speech_time = 0
+    context = ""
     silero_buf = np.zeros(0, dtype=np.float32)
     pre_buf_maxlen = int(PRE_BUFFER_SEC / (CHUNK_MS / 1000))
     pre_buffer = collections.deque(maxlen=pre_buf_maxlen)
@@ -122,24 +129,28 @@ def main():
     for chunk in chunks:
         if not active:
             # Idle — drain audio, wait for START
-            cmd = check_stdin("START")
-            if cmd == "EOF":
+            result = read_stdin_cmd()
+            if result and result[0] == "EOF":
                 break
-            if cmd == "START":
+            if result and result[0] == "START":
                 active = True
                 recording = False
                 frames = []
                 silence_start = None
                 last_speech_time = time.time()
+                context = result[1].get("context", "")
                 silero_buf = np.zeros(0, dtype=np.float32)
                 pre_buffer.clear()
                 vad.reset_states()
-                print("STT: active", file=sys.stderr, flush=True)
+                if context:
+                    print(f"STT: active (context: {context[:80]})", file=sys.stderr, flush=True)
+                else:
+                    print("STT: active", file=sys.stderr, flush=True)
             continue
 
         # Active — check for STOP
-        cmd = check_stdin("STOP")
-        if cmd in ("STOP", "EOF"):
+        result = read_stdin_cmd()
+        if result and result[0] in ("STOP", "EOF"):
             active = False
             print("END", flush=True)
             print("STT: idle", file=sys.stderr, flush=True)
@@ -183,8 +194,10 @@ def main():
                     duration = len(audio) / SAMPLE_RATE
 
                     if duration >= MIN_SPEECH_SEC:
-                        segments = whisper.transcribe(audio, language="auto",
-                                                     translate=False)
+                        kwargs = {"language": "auto", "translate": False}
+                        if context:
+                            kwargs["initial_prompt"] = context
+                        segments = whisper.transcribe(audio, **kwargs)
                         text = " ".join(seg.text.strip()
                                         for seg in segments).strip()
                         if text:
