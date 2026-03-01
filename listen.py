@@ -41,9 +41,30 @@ MIN_SPEECH_SEC = 0.3
 SILERO_CHUNK = 512
 
 
+def check_models(whisper_model):
+    """Fail fast if models aren't pre-downloaded. Run make prepare."""
+    from pathlib import Path
+    hub_dir = Path(torch.hub.get_dir())
+    silero = list(hub_dir.glob("snakers4_silero-vad*"))
+    if not silero:
+        print("ERROR: Silero VAD not found. Run: make prepare",
+              file=sys.stderr, flush=True)
+        sys.exit(1)
+    # pywhispercpp stores models in platform-specific app support dir
+    home = Path.home()
+    whisper_paths = [
+        home / "Library" / "Application Support" / "pywhispercpp" / "models" / f"ggml-{whisper_model}.bin",
+        home / ".local" / "share" / "pywhispercpp" / "models" / f"ggml-{whisper_model}.bin",
+    ]
+    if not any(p.exists() for p in whisper_paths):
+        print(f"ERROR: Whisper model '{whisper_model}' not found. Run: make prepare",
+              file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
 def load_silero():
     model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad",
-                              verbose=False, onnx=False)
+                              verbose=False, onnx=False, trust_repo=True)
     return model
 
 
@@ -102,6 +123,8 @@ def main():
     parser.add_argument("--silence-timeout", type=float, default=5.0)
     parser.add_argument("--model", default="large-v3")
     args = parser.parse_args()
+
+    check_models(args.model)
 
     # Load models once
     print("STT: loading Silero VAD...", file=sys.stderr, flush=True)
