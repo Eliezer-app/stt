@@ -194,7 +194,7 @@ def main():
                     duration = len(audio) / SAMPLE_RATE
 
                     if duration >= MIN_SPEECH_SEC:
-                        kwargs = {"language": "auto", "translate": False}
+                        kwargs = {"language": "", "translate": False}
                         if context:
                             kwargs["initial_prompt"] = context
                         segments = whisper.transcribe(audio, **kwargs)
