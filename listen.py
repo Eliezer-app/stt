@@ -25,20 +25,24 @@ import socket
 import sys
 import time
 
+from pathlib import Path
+
 import numpy as np
 import torch
+import yaml
 from pywhispercpp.model import Model
+
+_DIR = Path(__file__).resolve().parent
 
 SAMPLE_RATE = 16000
 CHUNK_MS = 80
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_MS / 1000)
-
-# VAD
-SILERO_THRESHOLD = 0.6
-PRE_BUFFER_SEC = 1.0
-POST_SILENCE_SEC = 0.6
-MIN_SPEECH_SEC = 0.3
 SILERO_CHUNK = 512
+
+
+def load_config():
+    with open(_DIR / "config.yaml") as f:
+        return yaml.safe_load(f)
 
 
 def check_models(whisper_model):
@@ -120,17 +124,26 @@ def read_stdin_cmd():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio-source", default="mic")
-    parser.add_argument("--silence-timeout", type=float, default=5.0)
-    parser.add_argument("--model", default="large-v3")
     args = parser.parse_args()
 
-    check_models(args.model)
+    cfg = load_config()
+    vad_cfg = cfg.get("voice_detection", {})
+    model_cfg = cfg.get("model", {})
+
+    model_name = model_cfg.get("name", "large-v3")
+    silence_timeout = model_cfg.get("silence_timeout", 5.0)
+    silero_threshold = vad_cfg.get("threshold", 0.5)
+    pre_buffer_sec = vad_cfg.get("pre_buffer_sec", 1.0)
+    post_silence_sec = vad_cfg.get("post_silence_sec", 0.6)
+    min_speech_sec = vad_cfg.get("min_speech_sec", 0.3)
+
+    check_models(model_name)
 
     # Load models once
     print("STT: loading Silero VAD...", file=sys.stderr, flush=True)
     vad = load_silero()
-    print(f"STT: loading whisper model '{args.model}'...", file=sys.stderr, flush=True)
-    whisper = Model(args.model, print_progress=False, redirect_whispercpp_logs_to=None)
+    print(f"STT: loading whisper model '{model_name}'...", file=sys.stderr, flush=True)
+    whisper = Model(model_name, print_progress=False, redirect_whispercpp_logs_to=None)
     print("STT: ready", file=sys.stderr, flush=True)
 
     # Audio source
@@ -146,7 +159,7 @@ def main():
     last_speech_time = 0
     context = ""
     silero_buf = np.zeros(0, dtype=np.float32)
-    pre_buf_maxlen = int(PRE_BUFFER_SEC / (CHUNK_MS / 1000))
+    pre_buf_maxlen = int(pre_buffer_sec / (CHUNK_MS / 1000))
     pre_buffer = collections.deque(maxlen=pre_buf_maxlen)
 
     for chunk in chunks:
@@ -185,7 +198,7 @@ def main():
         while len(silero_buf) >= SILERO_CHUNK:
             prob = vad_speech_prob(vad, silero_buf[:SILERO_CHUNK])
             silero_buf = silero_buf[SILERO_CHUNK:]
-            if prob > SILERO_THRESHOLD:
+            if prob > silero_threshold:
                 is_speech = True
 
         if not recording:
@@ -199,8 +212,8 @@ def main():
                 last_speech_time = time.time()
             else:
                 pre_buffer.append(chunk)
-                if args.silence_timeout > 0 and \
-                   time.time() - last_speech_time > args.silence_timeout:
+                if silence_timeout > 0 and \
+                   time.time() - last_speech_time > silence_timeout:
                     active = False
                     print("END", flush=True)
                     print("STT: idle (silence timeout)", file=sys.stderr, flush=True)
@@ -212,11 +225,11 @@ def main():
             else:
                 if silence_start is None:
                     silence_start = time.time()
-                elif time.time() - silence_start >= POST_SILENCE_SEC:
+                elif time.time() - silence_start >= post_silence_sec:
                     audio = np.concatenate(frames)
                     duration = len(audio) / SAMPLE_RATE
 
-                    if duration >= MIN_SPEECH_SEC:
+                    if duration >= min_speech_sec:
                         kwargs = {"language": "", "translate": False}
                         if context:
                             kwargs["initial_prompt"] = context
