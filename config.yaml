@@ -6,4 +6,4 @@ voice_detection:
 
 model:
   name: large-v3
-  silence_timeout: 5.0
+  silence_timeout: 2.0
