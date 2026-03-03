@@ -172,6 +172,7 @@ def main():
                 active = True
                 recording = False
                 frames = []
+                transcript = []
                 silence_start = None
                 last_speech_time = time.time()
                 context = result[1].get("context", "")
@@ -230,14 +231,16 @@ def main():
                     duration = len(audio) / SAMPLE_RATE
 
                     if duration >= min_speech_sec:
+                        prompt = " ".join([context] + transcript) if transcript else context
                         kwargs = {"language": "", "translate": False}
-                        if context:
-                            kwargs["initial_prompt"] = context
+                        if prompt:
+                            kwargs["initial_prompt"] = prompt
                         segments = whisper.transcribe(audio, **kwargs)
                         text = " ".join(seg.text.strip()
                                         for seg in segments).strip()
                         if text:
                             print(text, flush=True)
+                            transcript.append(text)
 
                     recording = False
                     frames = []
