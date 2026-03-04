@@ -20,7 +20,9 @@ Usage:
 import argparse
 import collections
 import json
+import os
 import select
+import signal
 import socket
 import sys
 import time
@@ -89,12 +91,18 @@ def audio_from_mic():
 def audio_from_socket(sock_path):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)
+    sock.settimeout(0.5)
     chunk_bytes = CHUNK_SAMPLES * 4
     buf = b""
     try:
-        while True:
+        while running:
             while len(buf) < chunk_bytes:
-                data = sock.recv(chunk_bytes - len(buf))
+                try:
+                    data = sock.recv(chunk_bytes - len(buf))
+                except socket.timeout:
+                    if not running:
+                        return
+                    continue
                 if not data:
                     return
                 buf += data
@@ -119,6 +127,22 @@ def read_stdin_cmd():
             # Plain text fallback (e.g. "STOP")
             return (line, {})
     return None
+
+
+running = True
+_sigcount = 0
+
+
+def _handle_signal(*_):
+    global running, _sigcount
+    _sigcount += 1
+    running = False
+    if _sigcount >= 2:
+        os._exit(1)
+
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 
 
 def main():
