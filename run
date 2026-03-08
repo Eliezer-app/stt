@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run STT: Silero VAD + pywhispercpp (Metal GPU).
+# Run STT: Apple on-device speech recognition (eli-stt).
 # Usage: stt/run --audio-source /tmp/speech-audio.sock
 set -euo pipefail
 

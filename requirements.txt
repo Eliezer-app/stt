@@ -1,7 +1,1 @@
-numpy
-packaging
-pywhispercpp
 pyyaml
-sounddevice
-torch
-torchaudio

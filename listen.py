@@ -1,115 +1,53 @@
 """
-STT listener: Silero VAD + pywhispercpp (Metal GPU).
+STT listener using Apple's on-device speech recognition (hear).
 
-Loads models once at startup, then waits for START on stdin.
-Accumulates audio while speech is detected, transcribes complete
-utterances after silence. Prints END when silence timeout expires,
-then waits for next START. Drains audio while idle so the socket
-doesn't back up.
+Waits for START on stdin, spawns `hear` for each listening session,
+forwards incremental transcription lines to stdout. Each line from
+hear is the full transcription so far (replaces previous, not additive).
+Prints END when hear exits (silence timeout) or on STOP.
+
+When --audio-source is a socket path, reads audio from the socket and
+pipes it to hear's stdin (16kHz mono float32 PCM). This ensures the
+orchestrator's audio muting works for STT too.
+
+When --audio-source is "mic" (default), hear captures directly from
+the system microphone.
 
 Protocol (stdin/stdout):
-  stdin:  "START\n" — begin listening
-  stdout: transcribed text lines
-  stdout: "END\n"   — silence timeout, back to idle
+  stdin:  {"cmd":"START"} — begin listening (spawn hear)
+  stdin:  {"cmd":"STOP"}  — stop current session
+  stdout: transcription lines (each line = full text so far)
+  stdout: "END"           — session over, back to idle
 
 Usage:
   python listen.py --audio-source /tmp/speech-audio.sock
-  python listen.py  # mic (default)
+  python listen.py --auto-start  # standalone (mic)
 """
 
 import argparse
-import collections
 import json
 import os
 import select
 import signal
 import socket
+import subprocess
 import sys
+import threading
 import time
-
 from pathlib import Path
 
-import numpy as np
-import torch
 import yaml
-from pywhispercpp.model import Model
 
 _DIR = Path(__file__).resolve().parent
 
 SAMPLE_RATE = 16000
-CHUNK_MS = 80
-CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_MS / 1000)
-SILERO_CHUNK = 512
+CHUNK_SAMPLES = 1280  # 80ms
+CHUNK_BYTES = CHUNK_SAMPLES * 4  # float32
 
 
 def load_config():
     with open(_DIR / "config.yaml") as f:
         return yaml.safe_load(f)
-
-
-def check_models(whisper_model):
-    """Fail fast if models aren't pre-downloaded. Run make prepare."""
-    from pathlib import Path
-    hub_dir = Path(torch.hub.get_dir())
-    silero = list(hub_dir.glob("snakers4_silero-vad*"))
-    if not silero:
-        print("ERROR: Silero VAD not found. Run: make prepare",
-              file=sys.stderr, flush=True)
-        sys.exit(1)
-    # pywhispercpp stores models in platform-specific app support dir
-    home = Path.home()
-    whisper_paths = [
-        home / "Library" / "Application Support" / "pywhispercpp" / "models" / f"ggml-{whisper_model}.bin",
-        home / ".local" / "share" / "pywhispercpp" / "models" / f"ggml-{whisper_model}.bin",
-    ]
-    if not any(p.exists() for p in whisper_paths):
-        print(f"ERROR: Whisper model '{whisper_model}' not found. Run: make prepare",
-              file=sys.stderr, flush=True)
-        sys.exit(1)
-
-
-def load_silero():
-    model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad",
-                              verbose=False, onnx=False, trust_repo=True)
-    return model
-
-
-def vad_speech_prob(model, audio_chunk):
-    t = torch.from_numpy(audio_chunk)
-    return model(t, SAMPLE_RATE).item()
-
-
-def audio_from_mic():
-    import sounddevice as sd
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                        blocksize=CHUNK_SAMPLES) as stream:
-        while True:
-            chunk, _ = stream.read(CHUNK_SAMPLES)
-            yield chunk[:, 0]
-
-
-def audio_from_socket(sock_path):
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
-    sock.settimeout(0.5)
-    chunk_bytes = CHUNK_SAMPLES * 4
-    buf = b""
-    try:
-        while running:
-            while len(buf) < chunk_bytes:
-                try:
-                    data = sock.recv(chunk_bytes - len(buf))
-                except socket.timeout:
-                    if not running:
-                        return
-                    continue
-                if not data:
-                    return
-                buf += data
-            yield np.frombuffer(buf[:chunk_bytes], dtype=np.float32)
-            buf = buf[chunk_bytes:]
-    finally:
-        sock.close()
 
 
 def read_stdin_cmd():
@@ -124,7 +62,6 @@ def read_stdin_cmd():
             data = json.loads(line)
             return (data.get("cmd", ""), data)
         except json.JSONDecodeError:
-            # Plain text fallback (e.g. "STOP")
             return (line, {})
     return None
 
@@ -145,134 +82,149 @@ signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
 
+def spawn_hear(timeout=None, locale="en-US", pipe_stdin=False):
+    """Spawn hear subprocess. Returns Popen object."""
+    cmd = [str(_DIR / "eli-stt"), "-d", "-p", "-l", locale]
+    if timeout:
+        cmd.extend(["-t", str(timeout)])
+    stdin = subprocess.PIPE if pipe_stdin else None
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=stdin)
+
+
+def kill_hear(proc):
+    """Terminate hear subprocess."""
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def socket_to_stdin(sock_path, proc):
+    """Read audio from unix socket and write to proc's stdin.
+    Runs in a background thread. Stops when proc exits or socket closes."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(sock_path)
+    except (ConnectionRefusedError, FileNotFoundError) as e:
+        print(f"STT: socket connect failed: {e}", file=sys.stderr, flush=True)
+        return
+    sock.settimeout(0.5)
+    buf = b""
+    try:
+        while proc.poll() is None:
+            while len(buf) < CHUNK_BYTES:
+                try:
+                    data = sock.recv(CHUNK_BYTES - len(buf))
+                except socket.timeout:
+                    if proc.poll() is not None:
+                        return
+                    continue
+                if not data:
+                    return
+                buf += data
+            try:
+                proc.stdin.write(buf[:CHUNK_BYTES])
+                proc.stdin.flush()
+            except BrokenPipeError:
+                return
+            buf = buf[CHUNK_BYTES:]
+    finally:
+        sock.close()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--audio-source", default="mic")
+    parser.add_argument("--audio-source", default="mic",
+                        help="'mic' or path to unix socket for audio input")
+    parser.add_argument("--auto-start", action="store_true",
+                        help="Start listening immediately, no silence timeout")
     args = parser.parse_args()
 
     cfg = load_config()
-    vad_cfg = cfg.get("voice_detection", {})
     model_cfg = cfg.get("model", {})
+    silence_timeout = model_cfg.get("silence_timeout", 2.0)
+    use_socket = args.audio_source != "mic"
 
-    model_name = model_cfg.get("name", "large-v3")
-    silence_timeout = model_cfg.get("silence_timeout", 5.0)
-    silero_threshold = vad_cfg.get("threshold", 0.5)
-    pre_buffer_sec = vad_cfg.get("pre_buffer_sec", 1.0)
-    post_silence_sec = vad_cfg.get("post_silence_sec", 0.6)
-    min_speech_sec = vad_cfg.get("min_speech_sec", 0.3)
-
-    check_models(model_name)
-
-    # Load models once
-    print("STT: loading Silero VAD...", file=sys.stderr, flush=True)
-    vad = load_silero()
-    print(f"STT: loading whisper model '{model_name}'...", file=sys.stderr, flush=True)
-    whisper = Model(model_name, print_progress=False, redirect_whispercpp_logs_to=None)
     print("STT: ready", file=sys.stderr, flush=True)
 
-    # Audio source
-    if args.audio_source == "mic":
-        chunks = audio_from_mic()
-    else:
-        chunks = audio_from_socket(args.audio_source)
+    active = args.auto_start
+    hear_proc = None
+    feeder = None
 
-    active = False
-    recording = False
-    frames = []
-    silence_start = None
-    last_speech_time = 0
-    context = ""
-    silero_buf = np.zeros(0, dtype=np.float32)
-    pre_buf_maxlen = int(pre_buffer_sec / (CHUNK_MS / 1000))
-    pre_buffer = collections.deque(maxlen=pre_buf_maxlen)
+    if active:
+        if use_socket:
+            hear_proc = spawn_hear(pipe_stdin=True)
+            feeder = threading.Thread(target=socket_to_stdin,
+                                      args=(args.audio_source, hear_proc),
+                                      daemon=True)
+            feeder.start()
+        else:
+            hear_proc = spawn_hear()  # mic, no timeout
+        print("STT: active", file=sys.stderr, flush=True)
 
-    for chunk in chunks:
+    while running:
         if not active:
-            # Idle — drain audio, wait for START
+            # Idle — wait for START
+            time.sleep(0.05)
             result = read_stdin_cmd()
             if result and result[0] == "EOF":
                 break
             if result and result[0] == "START":
                 active = True
-                recording = False
-                frames = []
-                transcript = []
-                silence_start = None
-                last_speech_time = time.time()
-                context = result[1].get("context", "")
-                silero_buf = np.zeros(0, dtype=np.float32)
-                pre_buffer.clear()
-                vad.reset_states()
-                if context:
-                    print(f"STT: active (context: {context[:80]})", file=sys.stderr, flush=True)
+                if use_socket:
+                    hear_proc = spawn_hear(timeout=silence_timeout,
+                                           pipe_stdin=True)
+                    feeder = threading.Thread(target=socket_to_stdin,
+                                              args=(args.audio_source, hear_proc),
+                                              daemon=True)
+                    feeder.start()
                 else:
-                    print("STT: active", file=sys.stderr, flush=True)
+                    hear_proc = spawn_hear(timeout=silence_timeout)
+                print("STT: active", file=sys.stderr, flush=True)
             continue
 
         # Active — check for STOP
         result = read_stdin_cmd()
         if result and result[0] in ("STOP", "EOF"):
+            kill_hear(hear_proc)
+            hear_proc = None
             active = False
             print("END", flush=True)
             print("STT: idle", file=sys.stderr, flush=True)
             continue
 
-        # Feed chunk to silero
-        silero_buf = np.append(silero_buf, chunk)
-        is_speech = False
-        while len(silero_buf) >= SILERO_CHUNK:
-            prob = vad_speech_prob(vad, silero_buf[:SILERO_CHUNK])
-            silero_buf = silero_buf[SILERO_CHUNK:]
-            if prob > silero_threshold:
-                is_speech = True
+        if hear_proc is None:
+            active = False
+            continue
 
-        if not recording:
-            if is_speech:
-                recording = True
-                silence_start = None
-                frames = list(pre_buffer)
-                frames.append(chunk)
-                pre_buffer.clear()
-                vad.reset_states()
-                last_speech_time = time.time()
-            else:
-                pre_buffer.append(chunk)
-                if silence_timeout > 0 and \
-                   time.time() - last_speech_time > silence_timeout:
-                    active = False
-                    print("END", flush=True)
-                    print("STT: idle (silence timeout)", file=sys.stderr, flush=True)
-        else:
-            frames.append(chunk)
-            if is_speech:
-                silence_start = None
-                last_speech_time = time.time()
-            else:
-                if silence_start is None:
-                    silence_start = time.time()
-                elif time.time() - silence_start >= post_silence_sec:
-                    audio = np.concatenate(frames)
-                    duration = len(audio) / SAMPLE_RATE
+        # Check if hear exited (silence timeout)
+        if hear_proc.poll() is not None:
+            # Drain remaining output
+            for raw in hear_proc.stdout:
+                line = raw.decode().strip()
+                if line:
+                    print(line, flush=True)
+            hear_proc = None
+            active = False
+            print("END", flush=True)
+            print("STT: idle (timeout)", file=sys.stderr, flush=True)
+            continue
 
-                    if duration >= min_speech_sec:
-                        prompt = " ".join([context] + transcript) if transcript else context
-                        kwargs = {"language": "", "translate": False}
-                        if prompt:
-                            kwargs["initial_prompt"] = prompt
-                        segments = whisper.transcribe(audio, **kwargs)
-                        text = " ".join(seg.text.strip()
-                                        for seg in segments).strip()
-                        if text:
-                            print(text, flush=True)
-                            transcript.append(text)
+        # Non-blocking read from hear stdout
+        ready, _, _ = select.select([hear_proc.stdout], [], [], 0.05)
+        if ready:
+            line = hear_proc.stdout.readline().decode().strip()
+            if line:
+                print(line, flush=True)
 
-                    recording = False
-                    frames = []
-                    silence_start = None
-                    pre_buffer.clear()
-                    vad.reset_states()
-                    silero_buf = np.zeros(0, dtype=np.float32)
-                    last_speech_time = time.time()
+    kill_hear(hear_proc)
 
 
 if __name__ == "__main__":
