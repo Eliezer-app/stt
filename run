@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run STT: Apple on-device speech recognition (eli-stt).
-# Usage: stt/run --audio-source /tmp/speech-audio.sock
+# Reads config.yaml, launches eli-stt with the right flags.
+# Usage: stt/run
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/.venv/bin/python" -u "$DIR/listen.py" "$@"
+exec "$DIR/.venv/bin/python" -u "$DIR/launch.py" "$@"

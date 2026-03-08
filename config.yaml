@@ -1,9 +1,3 @@
-voice_detection:
-  threshold: 0.5
-  pre_buffer_sec: 1.0
-  post_silence_sec: 0.6
-  min_speech_sec: 0.3
-
 model:
-  name: large-v3
-  silence_timeout: 2.0
+  silence_timeout: 3.0
+  stop_word: stop listening

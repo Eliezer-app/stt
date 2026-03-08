@@ -1,19 +1,26 @@
-/// eli-stt — command line speech recognition for macOS
-/// Reads 16kHz mono float32 PCM from stdin, outputs incremental transcription.
-/// Usage: eli-stt [-t timeout] [-l locale]
-///   Audio on stdin: raw float32 PCM, 16kHz, mono
-///   No stdin (tty): captures from system microphone
+/// eli-stt — persistent speech recognition service for macOS
+/// Reads JSON commands on stdin, captures audio from microphone.
+///
+/// Protocol:
+///   stdin:  {"cmd":"START"}  — begin listening session
+///   stdin:  {"cmd":"STOP"}   — stop current session
+///   stdout: transcription lines (each line = full text so far)
+///   stdout: END              — session over (silence timeout)
+///   stdout: CANCEL           — session cancelled (stop-word detected)
+///   stderr: "STT: ready"    — recognizer loaded, ready for commands
 
 import AppKit
 import AVFoundation
 import Speech
 
 let sampleRate: Double = 16000
+let playbackRate: Double = 48000
 var timeout: Double = 0
 var locale = "en-US"
 var useOnDevice = true
 var addPunctuation = true
 var contextualStrings: [String] = []
+var stopWord: String = ""
 
 // Parse args
 var i = 1
@@ -30,18 +37,22 @@ while i < CommandLine.arguments.count {
         useOnDevice = true
     case "-p", "--punctuation":
         addPunctuation = true
+    case "-s", "--stop-word":
+        i += 1
+        stopWord = CommandLine.arguments[i]
     case "-c", "--context":
         i += 1
         contextualStrings.append(contentsOf: CommandLine.arguments[i].split(separator: ",").map { String($0) })
     case "-h", "--help":
-        fputs("eli-stt — speech recognition from stdin or microphone\n", stderr)
-        fputs("Usage: eli-stt [-d] [-p] [-l locale] [-t timeout]\n", stderr)
+        fputs("eli-stt — persistent speech recognition service\n", stderr)
+        fputs("Usage: eli-stt [-d] [-p] [-l locale] [-t timeout] [-s stop-word]\n", stderr)
         fputs("  -d  On-device recognition (default)\n", stderr)
         fputs("  -p  Add punctuation (default)\n", stderr)
         fputs("  -l  Locale (default: en-US)\n", stderr)
         fputs("  -t  Silence timeout in seconds (0 = no timeout)\n", stderr)
-        fputs("  -c  Contextual strings, comma-separated (e.g. \"Eliezer,Yudkowsky\")\n", stderr)
-        fputs("Audio: 16kHz mono float32 PCM on stdin, or microphone if stdin is a tty\n", stderr)
+        fputs("  -s  Stop word — end session when detected unquoted\n", stderr)
+        fputs("  -c  Contextual strings, comma-separated\n", stderr)
+        fputs("Reads JSON commands on stdin, captures audio from microphone.\n", stderr)
         exit(0)
     default:
         break
@@ -49,41 +60,144 @@ while i < CommandLine.arguments.count {
     i += 1
 }
 
-let useMic = isatty(STDIN_FILENO) != 0
-
-// Keep engine alive for mic mode
+// Global state
 var audioEngine: AVAudioEngine?
+var currentTask: SFSpeechRecognitionTask?
+var currentRequest: SFSpeechAudioBufferRecognitionRequest?
 var timeoutTimer: Timer?
+var sessionActive = false
 
 func resetTimer() {
     timeoutTimer?.invalidate()
     guard timeout > 0 else { return }
     timeoutTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { _ in
-        exit(0)
+        endSession()
     }
 }
 
+func endSession(stopped: Bool = false) {
+    guard sessionActive else { return }
+    sessionActive = false
+    timeoutTimer?.invalidate()
+    timeoutTimer = nil
+    currentTask?.cancel()
+    currentTask = nil
+    currentRequest?.endAudio()
+    currentRequest = nil
+    // Remove mic tap
+    if let engine = audioEngine, engine.isRunning {
+        engine.inputNode.removeTap(onBus: 0)
+    }
+    print(stopped ? "CANCEL" : "END")
+    fflush(stdout)
+    fputs("STT: idle\n", stderr)
+}
+
+func playBeep() {
+    let count = Int(playbackRate * 0.15)
+    let fade = Int(playbackRate * 0.01)
+    var samples = [Float](repeating: 0, count: count)
+    for i in 0..<count {
+        let t = Float(i) / Float(playbackRate)
+        samples[i] = sin(2 * .pi * 880 * t) * 0.3
+    }
+    // Fade in
+    for i in 0..<fade {
+        samples[i] *= Float(i) / Float(fade)
+    }
+    // Fade out
+    for i in 0..<fade {
+        samples[count - 1 - i] *= Float(i) / Float(fade)
+    }
+
+    let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                               sampleRate: playbackRate,
+                               channels: 1,
+                               interleaved: false)!
+    let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                  frameCapacity: AVAudioFrameCount(count))!
+    buffer.frameLength = AVAudioFrameCount(count)
+    memcpy(buffer.floatChannelData![0], samples, count * MemoryLayout<Float>.size)
+
+    let player = AVAudioPlayerNode()
+    let engine = AVAudioEngine()
+    engine.attach(player)
+    engine.connect(player, to: engine.mainMixerNode, format: format)
+    try? engine.start()
+    player.scheduleBuffer(buffer, at: nil)
+    player.play()
+    // Wait for playback to finish
+    Thread.sleep(forTimeInterval: 0.2)
+    engine.stop()
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
+    var recognizer: SFSpeechRecognizer?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         SFSpeechRecognizer.requestAuthorization { status in
             guard status == .authorized else {
                 fputs("Speech recognition not authorized: \(status.rawValue)\n", stderr)
                 exit(1)
             }
-            DispatchQueue.main.async { self.startRecognition() }
+            DispatchQueue.main.async { self.setup() }
         }
     }
 
-    func startRecognition() {
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale)) else {
+    func setup() {
+        guard let rec = SFSpeechRecognizer(locale: Locale(identifier: locale)) else {
             fputs("Cannot create recognizer for locale \(locale)\n", stderr)
             exit(1)
         }
-
-        if useOnDevice && !recognizer.supportsOnDeviceRecognition {
+        if useOnDevice && !rec.supportsOnDeviceRecognition {
             fputs("On-device recognition not supported for \(locale)\n", stderr)
             exit(1)
         }
+        recognizer = rec
+
+        // Prepare audio engine (stays alive)
+        let engine = AVAudioEngine()
+        audioEngine = engine
+
+        fputs("STT: ready\n", stderr)
+
+        // Read commands on stdin in background
+        DispatchQueue.global(qos: .userInitiated).async {
+            while let line = readLine() {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+
+                var cmd = trimmed
+                // Try JSON
+                if let data = trimmed.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let c = json["cmd"] as? String {
+                    cmd = c
+                }
+
+                DispatchQueue.main.async {
+                    switch cmd {
+                    case "START":
+                        self.startSession()
+                    case "STOP":
+                        endSession()
+                    default:
+                        fputs("STT: unknown command: \(cmd)\n", stderr)
+                    }
+                }
+            }
+            // stdin closed
+            DispatchQueue.main.async { exit(0) }
+        }
+    }
+
+    func startSession() {
+        // Stop any existing session
+        if sessionActive {
+            endSession()
+        }
+
+        guard let recognizer = recognizer, let engine = audioEngine else { return }
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
@@ -92,19 +206,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !contextualStrings.isEmpty {
             request.contextualStrings = contextualStrings
         }
+        currentRequest = request
 
-        // Accumulate text across recognition segments (recognizer resets on pauses)
         var finalized = ""
         var prevSegment = ""
 
-        recognizer.recognitionTask(with: request) { result, error in
+        currentTask = recognizer.recognitionTask(with: request) { result, error in
+            guard sessionActive else { return }
+
             if let error = error {
-                fputs("Error: \(error.localizedDescription)\n", stderr)
+                fputs("STT: error: \(error.localizedDescription)\n", stderr)
+                DispatchQueue.main.async { endSession() }
                 return
             }
             guard let result = result else { return }
 
-            resetTimer()
+            DispatchQueue.main.async { resetTimer() }
 
             let segment = result.bestTranscription.formattedString
 
@@ -115,6 +232,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             prevSegment = segment
 
             let full = finalized.isEmpty ? segment : finalized + " " + segment
+
+            // Stop-word: end session if unquoted match found (don't output the trigger line)
+            if !stopWord.isEmpty {
+                let lower = full.lowercased()
+                let sw = stopWord.lowercased()
+                if let range = lower.range(of: sw) {
+                    let prefix = full[full.startIndex..<range.lowerBound]
+                    if !prefix.contains("\"") {
+                        DispatchQueue.main.async { endSession(stopped: true) }
+                        return
+                    }
+                }
+            }
+
             print(full)
             fflush(stdout)
 
@@ -124,47 +255,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                   sampleRate: sampleRate,
-                                   channels: 1,
-                                   interleaved: false)!
+        // Install mic tap
+        let inputNode = engine.inputNode
+        let micFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 3200, format: micFormat) { buffer, _ in
+            request.append(buffer)
+        }
 
-        if useMic {
-            let engine = AVAudioEngine()
-            audioEngine = engine  // prevent deallocation
-            let inputNode = engine.inputNode
-            inputNode.installTap(onBus: 0, bufferSize: 3200,
-                                 format: inputNode.outputFormat(forBus: 0)) { buffer, _ in
-                request.append(buffer)
-            }
+        if !engine.isRunning {
             do {
                 try engine.start()
             } catch {
-                fputs("Failed to start audio engine: \(error)\n", stderr)
-                exit(1)
-            }
-        } else {
-            DispatchQueue.global(qos: .userInitiated).async {
-                let chunkSize = 1600  // 100ms at 16kHz
-                let buf = UnsafeMutablePointer<Float>.allocate(capacity: chunkSize)
-                defer { buf.deallocate() }
-
-                while true {
-                    let n = fread(buf, MemoryLayout<Float>.size, chunkSize, stdin)
-                    if n == 0 {
-                        request.endAudio()
-                        break
-                    }
-                    let pcm = AVAudioPCMBuffer(pcmFormat: format,
-                                               frameCapacity: AVAudioFrameCount(n))!
-                    pcm.frameLength = AVAudioFrameCount(n)
-                    memcpy(pcm.floatChannelData![0], buf, n * MemoryLayout<Float>.size)
-                    request.append(pcm)
-                }
+                fputs("STT: failed to start audio engine: \(error)\n", stderr)
+                return
             }
         }
 
+        sessionActive = true
+        playBeep()
         resetTimer()
+        fputs("STT: active\n", stderr)
     }
 }
 
