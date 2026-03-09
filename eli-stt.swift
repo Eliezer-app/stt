@@ -88,36 +88,38 @@ func endSession(stopped: Bool = false) {
     if let engine = audioEngine, engine.isRunning {
         engine.inputNode.removeTap(onBus: 0)
     }
+    playIdleBeep()
     print(stopped ? "CANCEL" : "END")
     fflush(stdout)
     fputs("STT: idle\n", stderr)
 }
 
-func playBeep() {
-    let count = Int(playbackRate * 0.15)
+func playTone(freq: Float, duration: Double, volume: Float = 0.3) -> [Float] {
+    let count = Int(playbackRate * duration)
     let fade = Int(playbackRate * 0.01)
     var samples = [Float](repeating: 0, count: count)
     for i in 0..<count {
         let t = Float(i) / Float(playbackRate)
-        samples[i] = sin(2 * .pi * 880 * t) * 0.3
+        samples[i] = sin(2 * .pi * freq * t) * volume
     }
-    // Fade in
     for i in 0..<fade {
         samples[i] *= Float(i) / Float(fade)
     }
-    // Fade out
     for i in 0..<fade {
         samples[count - 1 - i] *= Float(i) / Float(fade)
     }
+    return samples
+}
 
+func playSound(_ samples: [Float]) {
     let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                sampleRate: playbackRate,
                                channels: 1,
                                interleaved: false)!
     let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                  frameCapacity: AVAudioFrameCount(count))!
-    buffer.frameLength = AVAudioFrameCount(count)
-    memcpy(buffer.floatChannelData![0], samples, count * MemoryLayout<Float>.size)
+                                  frameCapacity: AVAudioFrameCount(samples.count))!
+    buffer.frameLength = AVAudioFrameCount(samples.count)
+    memcpy(buffer.floatChannelData![0], samples, samples.count * MemoryLayout<Float>.size)
 
     let player = AVAudioPlayerNode()
     let engine = AVAudioEngine()
@@ -126,9 +128,19 @@ func playBeep() {
     try? engine.start()
     player.scheduleBuffer(buffer, at: nil)
     player.play()
-    // Wait for playback to finish
-    Thread.sleep(forTimeInterval: 0.2)
+    let duration = Double(samples.count) / playbackRate + 0.05
+    Thread.sleep(forTimeInterval: duration)
     engine.stop()
+}
+
+func playBeep() {
+    playSound(playTone(freq: 880, duration: 0.1))
+}
+
+func playIdleBeep() {
+    let gap = [Float](repeating: 0, count: Int(playbackRate * 0.01))
+    let sound = playTone(freq: 660, duration: 0.08) + gap + playTone(freq: 440, duration: 0.1)
+    playSound(sound)
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
