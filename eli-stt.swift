@@ -2,8 +2,8 @@
 /// Reads JSON commands on stdin, captures audio from microphone.
 ///
 /// Protocol:
-///   stdin:  {"cmd":"START"}  — begin listening session
-///   stdin:  {"cmd":"STOP"}   — stop current session
+///   stdin:  START            — begin listening session
+///   stdin:  STOP             — stop current session
 ///   stdout: transcription lines (each line = full text so far)
 ///   stdout: END              — session over (silence timeout)
 ///   stdout: CANCEL           — session cancelled (stop-word detected)
@@ -179,22 +179,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
 
-                var cmd = trimmed
-                // Try JSON
-                if let data = trimmed.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let c = json["cmd"] as? String {
-                    cmd = c
-                }
-
                 DispatchQueue.main.async {
-                    switch cmd {
+                    switch trimmed {
                     case "START":
                         self.startSession()
                     case "STOP":
                         endSession()
                     default:
-                        fputs("STT: unknown command: \(cmd)\n", stderr)
+                        fputs("STT: unknown command: \(trimmed)\n", stderr)
                     }
                 }
             }
