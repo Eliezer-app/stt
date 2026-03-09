@@ -278,6 +278,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+signal(SIGTERM) { _ in exit(0) }
+signal(SIGINT) { _ in exit(0) }
+
 let delegate = AppDelegate()
 let app = NSApplication.shared
 app.delegate = delegate
