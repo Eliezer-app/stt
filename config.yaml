@@ -1,6 +1,3 @@
 model:
   silence_timeout: 3.0
   stop_word: stop listening
-
-tts:
-  voice: Serena
