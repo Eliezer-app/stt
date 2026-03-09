@@ -3,7 +3,8 @@
 ///
 /// Protocol:
 ///   stdin:  text to speak (one line = one utterance)
-///   stdout: DONE           — utterance finished playing
+///   stdin:  STOP           — interrupt current utterance
+///   stdout: DONE           — utterance finished (or stopped)
 ///   stderr: "TTS: ready"   — ready for input
 
 import AppKit
@@ -81,6 +82,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             while let line = readLine() {
                 let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !text.isEmpty else { continue }
+
+                if text == "STOP" {
+                    DispatchQueue.main.async {
+                        if self.synthesizer.isSpeaking {
+                            self.synthesizer.stopSpeaking(at: .immediate)
+                        }
+                    }
+                    continue
+                }
 
                 let sem = DispatchSemaphore(value: 0)
                 DispatchQueue.main.async {
