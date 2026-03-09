@@ -64,7 +64,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Find voice
         if !voiceName.isEmpty {
             let voices = AVSpeechSynthesisVoice.speechVoices()
-            selectedVoice = voices.first { $0.name.localizedCaseInsensitiveContains(voiceName) }
+            let matches = voices.filter { $0.name.localizedCaseInsensitiveContains(voiceName) }
+            selectedVoice = matches.max(by: { $0.quality.rawValue < $1.quality.rawValue })
                 ?? voices.first { $0.identifier.localizedCaseInsensitiveContains(voiceName) }
             if let v = selectedVoice {
                 fputs("TTS: using voice \(v.name) [\(v.language)]\n", stderr)
